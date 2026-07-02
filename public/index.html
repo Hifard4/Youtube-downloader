@@ -253,32 +253,26 @@
     if (!url) return;
 
     downloadBtn.disabled = true;
-    setStatus('Preparing download, this can take a moment...');
-    statusEl.innerHTML = '<span class="spinner"></span> Preparing download, this can take a moment...';
+    statusEl.innerHTML = '<span class="spinner"></span> Getting download link...';
 
     try {
       const res = await fetch('/api/download?url=' + encodeURIComponent(url));
+      const data = await res.json();
 
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Download failed.');
-      }
+      if (!res.ok) throw new Error(data.error || 'Download failed.');
 
-      const blob = await res.blob();
-      const disposition = res.headers.get('Content-Disposition') || '';
-      const match = disposition.match(/filename="(.+)"/);
-      const filename = match ? match[1] : 'video.mp4';
-
-      const downloadUrl = window.URL.createObjectURL(blob);
+      // Server returns the deciphered CDN URL — open it directly so the browser
+      // downloads straight from YouTube's servers (avoids cloud IP blocking).
       const a = document.createElement('a');
-      a.href = downloadUrl;
-      a.download = filename;
+      a.href = data.url;
+      a.download = data.filename || 'video.mp4';
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
       document.body.appendChild(a);
       a.click();
       a.remove();
-      window.URL.revokeObjectURL(downloadUrl);
 
-      setStatus('Video downloaded successfully!', 'success');
+      setStatus('Download started! Check your browser downloads.', 'success');
     } catch (err) {
       setStatus(err.message || 'Something went wrong.', 'error');
     } finally {

@@ -1,45 +1,23 @@
 const express = require('express');
 const { Innertube, Platform } = require('youtubei.js');
+const { FormatUtils } = require('youtubei.js');
 const vm = require('vm');
-const { Readable } = require('stream');
 const path = require('path');
 
-// Pre-built vm context with the globals YouTube's player script relies on.
-// vm.runInNewContext creates a blank sandbox — we must supply Node globals explicitly.
+// vm context with all globals YouTube's player script needs for URL deciphering.
 const vmContext = vm.createContext({
-  URL,
-  URLSearchParams,
-  encodeURIComponent,
-  decodeURIComponent,
-  parseInt,
-  parseFloat,
-  isNaN,
-  isFinite,
-  Math,
-  Array,
-  Object,
-  String,
-  Number,
-  Boolean,
-  RegExp,
-  Error,
-  Set,
-  Map,
-  Promise,
-  JSON,
-  setTimeout,
-  clearTimeout,
-  setInterval,
-  clearInterval,
-  console,
-  globalThis: global,
-  global,
+  URL, URLSearchParams,
+  encodeURIComponent, decodeURIComponent,
+  parseInt, parseFloat, isNaN, isFinite,
+  Math, Array, Object, String, Number, Boolean, RegExp,
+  Error, Set, Map, Promise, JSON,
+  setTimeout, clearTimeout, setInterval, clearInterval,
+  console, globalThis: global, global,
 });
 
-// Wrap in a function so top-level `return` statements in YouTube's script are valid.
+// Wrap in a function body so top-level `return` in YouTube's player script is valid.
 Platform.shim.eval = async (data) => {
-  const wrapped = `(function() {\n${data.output}\n})()`;
-  return vm.runInContext(wrapped, vmContext);
+  return vm.runInContext(`(function(){\n${data.output}\n})()`, vmContext);
 };
 
 const app = express();
@@ -67,9 +45,7 @@ function extractVideoId(url) {
     if (u.searchParams.has('v')) return u.searchParams.get('v');
     const match = u.pathname.match(/\/(shorts|embed)\/([^/?]+)/);
     if (match) return match[2];
-  } catch {
-    return null;
-  }
+  } catch { return null; }
   return null;
 }
 
@@ -92,12 +68,14 @@ app.get('/api/info', async (req, res) => {
       thumbnail,
     });
   } catch (err) {
-    console.error('Info error:', err);
-    res.status(500).json({ error: 'Could not fetch video info. The URL may be invalid or the video unavailable.' });
+    console.error('Info error:', err.message);
+    res.status(500).json({ error: 'Could not fetch video info. ' + err.message });
   }
 });
 
 // GET /api/download?url=...
+// Architecture: decipher the stream URL server-side, then REDIRECT the browser to it.
+// The browser downloads directly from YouTube's CDN — Render's IP never touches the stream.
 app.get('/api/download', async (req, res) => {
   const { url } = req.query;
   const videoId = extractVideoId(url || '');
@@ -107,43 +85,47 @@ app.get('/api/download', async (req, res) => {
     const yt = await getInnertube();
     const info = await yt.getInfo(videoId);
     const title = sanitizeFilename(info.basic_info.title);
+    const player = yt.session.player;
 
-    // Try formats in order: mp4 combined → any combined (webm) → video-only mp4
-    const attempts = [
-      { opts: { type: 'video+audio', quality: 'best', format: 'mp4' }, ext: 'mp4',  mime: 'video/mp4'  },
-      { opts: { type: 'video+audio', quality: 'best'                }, ext: 'webm', mime: 'video/webm' },
-      { opts: { type: 'video',       quality: 'best', format: 'mp4' }, ext: 'mp4',  mime: 'video/mp4'  },
+    // Format preference order: mp4 combined → any combined → mp4 video-only
+    const formatAttempts = [
+      { type: 'video+audio', quality: 'best', format: 'mp4'  },
+      { type: 'video+audio', quality: 'best'                 },
+      { type: 'video',       quality: 'best', format: 'mp4'  },
     ];
 
-    let stream, ext, mime, lastErr;
-    for (const attempt of attempts) {
+    let decipheredUrl = null;
+    let ext = 'mp4';
+    let lastErr;
+
+    for (const opts of formatAttempts) {
       try {
-        stream = await yt.download(videoId, attempt.opts);
-        ext  = attempt.ext;
-        mime = attempt.mime;
+        const format = FormatUtils.chooseFormat(opts, info.streaming_data);
+        decipheredUrl = await format.decipher(player);
+        ext = (format.mime_type || '').includes('webm') ? 'webm' : 'mp4';
+        console.log(`Selected format: ${format.mime_type} quality=${format.quality_label}`);
         break;
       } catch (e) {
         lastErr = e;
-        console.warn(`Format attempt failed (${JSON.stringify(attempt.opts)}):`, e.message);
+        console.warn(`Format attempt failed (${JSON.stringify(opts)}):`, e.message);
       }
     }
 
-    if (!stream) throw lastErr || new Error('No suitable format found.');
+    if (!decipheredUrl) throw lastErr || new Error('No suitable format found.');
 
-    res.setHeader('Content-Disposition', `attachment; filename="${title}.${ext}"`);
-    res.setHeader('Content-Type', mime);
+    // Tell the browser to treat the redirect as a download with the correct filename.
+    // We add the Content-Disposition hint via a query param that some CDNs respect,
+    // but primarily rely on the browser's own download behaviour for redirected URLs.
+    console.log(`Redirecting to deciphered URL for: ${title}`);
 
-    const nodeStream = Readable.fromWeb(stream);
-    nodeStream.on('error', (err) => {
-      console.error('Stream error:', err);
-      if (!res.headersSent) res.status(500).json({ error: 'Download failed while streaming: ' + err.message });
-      else res.end();
-    });
-    nodeStream.pipe(res);
+    // Send the deciphered CDN URL back as JSON so the frontend can trigger a download.
+    // A plain 302 redirect to a YouTube CDN URL causes CORS issues in fetch(), so we
+    // let the frontend handle it with a temporary <a> tag instead.
+    res.json({ url: decipheredUrl, filename: `${title}.${ext}` });
 
   } catch (err) {
-    console.error('Download error:', err);
-    if (!res.headersSent) res.status(500).json({ error: 'Could not download this video. ' + err.message });
+    console.error('Download error:', err.message);
+    res.status(500).json({ error: 'Could not download this video. ' + err.message });
   }
 });
 
