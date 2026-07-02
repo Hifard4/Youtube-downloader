@@ -4,11 +4,42 @@ const vm = require('vm');
 const { Readable } = require('stream');
 const path = require('path');
 
-// youtubei.js needs an evaluator to run YouTube's obfuscated player script,
-// which is required to decipher streaming URLs (signature + "n" params).
+// Pre-built vm context with the globals YouTube's player script relies on.
+// vm.runInNewContext creates a blank sandbox — we must supply Node globals explicitly.
+const vmContext = vm.createContext({
+  URL,
+  URLSearchParams,
+  encodeURIComponent,
+  decodeURIComponent,
+  parseInt,
+  parseFloat,
+  isNaN,
+  isFinite,
+  Math,
+  Array,
+  Object,
+  String,
+  Number,
+  Boolean,
+  RegExp,
+  Error,
+  Set,
+  Map,
+  Promise,
+  JSON,
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+  console,
+  globalThis: global,
+  global,
+});
+
+// Wrap in a function so top-level `return` statements in YouTube's script are valid.
 Platform.shim.eval = async (data) => {
   const wrapped = `(function() {\n${data.output}\n})()`;
-  return vm.runInNewContext(wrapped);
+  return vm.runInContext(wrapped, vmContext);
 };
 
 const app = express();
@@ -54,7 +85,6 @@ app.get('/api/info', async (req, res) => {
     const details = info.basic_info;
     const thumbnails = details.thumbnail || [];
     const thumbnail = thumbnails.length ? thumbnails[thumbnails.length - 1].url : null;
-
     res.json({
       title: details.title,
       author: details.author || 'Unknown',
@@ -78,19 +108,14 @@ app.get('/api/download', async (req, res) => {
     const info = await yt.getInfo(videoId);
     const title = sanitizeFilename(info.basic_info.title);
 
-    // Try formats in order of preference:
-    // 1. mp4 with video+audio (best compatibility, works for most short/medium videos)
-    // 2. any container with video+audio (covers videos only available as webm)
-    // 3. video-only mp4 (last resort — no audio, but better than nothing)
-    let stream, ext, mime;
-
+    // Try formats in order: mp4 combined → any combined (webm) → video-only mp4
     const attempts = [
-      { opts: { type: 'video+audio', quality: 'best', format: 'mp4' }, ext: 'mp4', mime: 'video/mp4' },
-      { opts: { type: 'video+audio', quality: 'best' },                 ext: 'webm', mime: 'video/webm' },
-      { opts: { type: 'video',       quality: 'best', format: 'mp4' }, ext: 'mp4', mime: 'video/mp4' },
+      { opts: { type: 'video+audio', quality: 'best', format: 'mp4' }, ext: 'mp4',  mime: 'video/mp4'  },
+      { opts: { type: 'video+audio', quality: 'best'                }, ext: 'webm', mime: 'video/webm' },
+      { opts: { type: 'video',       quality: 'best', format: 'mp4' }, ext: 'mp4',  mime: 'video/mp4'  },
     ];
 
-    let lastErr;
+    let stream, ext, mime, lastErr;
     for (const attempt of attempts) {
       try {
         stream = await yt.download(videoId, attempt.opts);
@@ -103,33 +128,23 @@ app.get('/api/download', async (req, res) => {
       }
     }
 
-    if (!stream) {
-      throw lastErr || new Error('No suitable format found.');
-    }
+    if (!stream) throw lastErr || new Error('No suitable format found.');
 
     res.setHeader('Content-Disposition', `attachment; filename="${title}.${ext}"`);
     res.setHeader('Content-Type', mime);
 
     const nodeStream = Readable.fromWeb(stream);
-
     nodeStream.on('error', (err) => {
       console.error('Stream error:', err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Download failed while streaming: ' + err.message });
-      } else {
-        res.end();
-      }
+      if (!res.headersSent) res.status(500).json({ error: 'Download failed while streaming: ' + err.message });
+      else res.end();
     });
-
     nodeStream.pipe(res);
+
   } catch (err) {
     console.error('Download error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Could not download this video. ' + err.message });
-    }
+    if (!res.headersSent) res.status(500).json({ error: 'Could not download this video. ' + err.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
