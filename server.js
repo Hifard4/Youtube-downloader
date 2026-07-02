@@ -6,11 +6,7 @@ const path = require('path');
 
 // youtubei.js needs an evaluator to run YouTube's obfuscated player script,
 // which is required to decipher streaming URLs (signature + "n" params).
-// The library ships no default evaluator on purpose; we provide one using Node's vm module.
 Platform.shim.eval = async (data) => {
-  // data.output may contain a top-level `return`, which is only valid inside a
-  // function body — so we wrap it in one, matching the pattern from youtubei.js's
-  // own docs (which use `new Function(data.output)()`), but via vm for Node.
   const wrapped = `(function() {\n${data.output}\n})()`;
   return vm.runInNewContext(wrapped);
 };
@@ -21,7 +17,6 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Innertube client is created lazily on first request and cached.
 let innertubeInstance = null;
 async function getInnertube() {
   if (!innertubeInstance) {
@@ -37,13 +32,8 @@ function sanitizeFilename(name) {
 function extractVideoId(url) {
   try {
     const u = new URL(url);
-    if (u.hostname === 'youtu.be') {
-      return u.pathname.slice(1);
-    }
-    if (u.searchParams.has('v')) {
-      return u.searchParams.get('v');
-    }
-    // handles /shorts/<id> and /embed/<id>
+    if (u.hostname === 'youtu.be') return u.pathname.slice(1);
+    if (u.searchParams.has('v')) return u.searchParams.get('v');
     const match = u.pathname.match(/\/(shorts|embed)\/([^/?]+)/);
     if (match) return match[2];
   } catch {
@@ -52,20 +42,16 @@ function extractVideoId(url) {
   return null;
 }
 
-// GET /api/info?url=...  -> title, author, duration, thumbnail for preview
+// GET /api/info?url=...
 app.get('/api/info', async (req, res) => {
   const { url } = req.query;
   const videoId = extractVideoId(url || '');
-
-  if (!videoId) {
-    return res.status(400).json({ error: 'Please provide a valid YouTube URL.' });
-  }
+  if (!videoId) return res.status(400).json({ error: 'Please provide a valid YouTube URL.' });
 
   try {
     const yt = await getInnertube();
     const info = await yt.getInfo(videoId);
     const details = info.basic_info;
-
     const thumbnails = details.thumbnail || [];
     const thumbnail = thumbnails.length ? thumbnails[thumbnails.length - 1].url : null;
 
@@ -81,32 +67,49 @@ app.get('/api/info', async (req, res) => {
   }
 });
 
-// GET /api/download?url=...  -> streams an mp4 (video+audio) to the browser as a file download
+// GET /api/download?url=...
 app.get('/api/download', async (req, res) => {
   const { url } = req.query;
   const videoId = extractVideoId(url || '');
-
-  if (!videoId) {
-    return res.status(400).json({ error: 'Please provide a valid YouTube URL.' });
-  }
+  if (!videoId) return res.status(400).json({ error: 'Please provide a valid YouTube URL.' });
 
   try {
     const yt = await getInnertube();
     const info = await yt.getInfo(videoId);
     const title = sanitizeFilename(info.basic_info.title);
 
-    // 'best' combines video+audio when a progressive format exists; otherwise
-    // youtubei.js muxes separate video/audio streams together on the fly.
-    const stream = await yt.download(videoId, {
-      type: 'video+audio',
-      quality: 'best',
-      format: 'mp4',
-    });
+    // Try formats in order of preference:
+    // 1. mp4 with video+audio (best compatibility, works for most short/medium videos)
+    // 2. any container with video+audio (covers videos only available as webm)
+    // 3. video-only mp4 (last resort — no audio, but better than nothing)
+    let stream, ext, mime;
 
-    res.setHeader('Content-Disposition', `attachment; filename="${title}.mp4"`);
-    res.setHeader('Content-Type', 'video/mp4');
+    const attempts = [
+      { opts: { type: 'video+audio', quality: 'best', format: 'mp4' }, ext: 'mp4', mime: 'video/mp4' },
+      { opts: { type: 'video+audio', quality: 'best' },                 ext: 'webm', mime: 'video/webm' },
+      { opts: { type: 'video',       quality: 'best', format: 'mp4' }, ext: 'mp4', mime: 'video/mp4' },
+    ];
 
-    // youtubei.js returns a WHATWG ReadableStream (web stream); convert to a Node stream to pipe.
+    let lastErr;
+    for (const attempt of attempts) {
+      try {
+        stream = await yt.download(videoId, attempt.opts);
+        ext  = attempt.ext;
+        mime = attempt.mime;
+        break;
+      } catch (e) {
+        lastErr = e;
+        console.warn(`Format attempt failed (${JSON.stringify(attempt.opts)}):`, e.message);
+      }
+    }
+
+    if (!stream) {
+      throw lastErr || new Error('No suitable format found.');
+    }
+
+    res.setHeader('Content-Disposition', `attachment; filename="${title}.${ext}"`);
+    res.setHeader('Content-Type', mime);
+
     const nodeStream = Readable.fromWeb(stream);
 
     nodeStream.on('error', (err) => {
